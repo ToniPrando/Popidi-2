@@ -1,0 +1,8 @@
+{
+  "name": "Remix Po Pi Di Burger Online 2",
+  "description": "Interactive ordering platform for Po Pi Di Hamburgueria featuring a digital menu and branding inspired by their Instagram profile.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

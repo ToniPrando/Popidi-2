@@ -1,0 +1,38 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User profiles and nested collections
+    match /users/{userId} {
+      allow read, write: if isOwner(userId) || true;
+      match /{allSubcollections=**} {
+        allow read, write: if isOwner(userId) || true;
+      }
+    }
+
+    // Orders Collection
+    match /orders/{orderId} {
+      allow create, read, update, delete: if true;
+    }
+
+    // Store Settings (Open/Close, Prep Time, Announcement)
+    match /store_settings/{settingId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Menu Item overrides
+    match /menu_items/{itemId} {
+      allow read: if true;
+      allow write: if true;
+    }
+  }
+}

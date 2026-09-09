@@ -1,0 +1,624 @@
+import { 
+  collection, 
+  doc, 
+  setDoc, 
+  getDoc, 
+  getDocs,
+  updateDoc, 
+  deleteDoc,
+  onSnapshot, 
+  query, 
+  where, 
+  limit, 
+  serverTimestamp,
+  Unsubscribe
+} from 'firebase/firestore';
+import { db } from '../lib/firebase';
+import { Order, OrderStatus, StoreSettings, UserProfile, MenuItem } from '../types';
+
+/**
+ * Sanitizes an object by recursively removing all `undefined` fields.
+ * Firestore throws a runtime exception if any field is `undefined`.
+ */
+export function sanitizeForFirestore<T>(obj: T): T {
+  if (obj === null || obj === undefined) {
+    return null as any;
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(sanitizeForFirestore) as any;
+  }
+  if (typeof obj === 'object') {
+    const cleaned: any = {};
+    for (const [key, value] of Object.entries(obj as any)) {
+      if (value !== undefined) {
+        cleaned[key] = sanitizeForFirestore(value);
+      }
+    }
+    return cleaned;
+  }
+  return obj;
+}
+
+/**
+ * Safely normalizes Firestore order data into a robust Order object.
+ */
+export function normalizeFirestoreOrder(data: any, id: string): Order {
+  let createdAtStr: string = new Date().toISOString();
+  if (data?.createdAt) {
+    if (typeof data.createdAt === 'object') {
+      if (typeof data.createdAt.toDate === 'function') {
+        createdAtStr = data.createdAt.toDate().toISOString();
+      } else if ('seconds' in data.createdAt) {
+        createdAtStr = new Date(Number(data.createdAt.seconds) * 1000).toISOString();
+      } else {
+        createdAtStr = String(data.createdAt);
+      }
+    } else {
+      createdAtStr = String(data.createdAt);
+    }
+  }
+
+  const rawItems = Array.isArray(data?.items) ? data.items : [];
+  const items = rawItems.map((it: any, index: number) => {
+    const rawMenuItem = it?.menuItem && typeof it.menuItem === 'object' ? it.menuItem : null;
+    return {
+      id: it?.id || `item-${index}-${Date.now()}`,
+      quantity: Number(it?.quantity) || 1,
+      unitPrice: Number(it?.unitPrice) || 0,
+      totalPrice: Number(it?.totalPrice) || 0,
+      menuItem: {
+        id: rawMenuItem?.id || it?.menuItemId || `item-${index}`,
+        name: rawMenuItem?.name || it?.name || 'Item do Pedido',
+        price: Number(rawMenuItem?.price) || Number(it?.unitPrice) || 0,
+        promotionalPrice: rawMenuItem?.promotionalPrice,
+        description: rawMenuItem?.description || '',
+        image: rawMenuItem?.image || '',
+        category: rawMenuItem?.category || 'artesanais',
+        badge: rawMenuItem?.badge,
+        prepTimeMinutes: rawMenuItem?.prepTimeMinutes,
+        available: rawMenuItem?.available !== false,
+        customizationGroups: Array.isArray(rawMenuItem?.customizationGroups) ? rawMenuItem.customizationGroups : [],
+      },
+      customizations: Array.isArray(it?.customizations) ? it.customizations : [],
+      notes: typeof it?.notes === 'string' ? it.notes : '',
+    };
+  });
+
+  const rawCustomer = data?.customer && typeof data.customer === 'object' ? data.customer : {};
+  const customerName = rawCustomer.name || data?.customerName || data?.userName || 'Cliente';
+  const customerPhone = rawCustomer.phone || data?.customerPhone || data?.userPhone || '';
+  const customerEmail = rawCustomer.email || data?.customerEmail || data?.userEmail || '';
+
+  return {
+    ...data,
+    id: id || data?.id || String(Math.random()),
+    shortCode: data?.shortCode || (`#PO-${(id || '0000').slice(-4).toUpperCase()}`),
+    createdAt: createdAtStr,
+    userId: data?.userId || data?.userUid,
+    userEmail: data?.userEmail || customerEmail,
+    customerPhone: data?.customerPhone || customerPhone,
+    customerEmail: data?.customerEmail || customerEmail,
+    total: Number(data?.total) || 0,
+    subtotal: Number(data?.subtotal) || 0,
+    deliveryFee: Number(data?.deliveryFee) || 0,
+    discount: Number(data?.discount) || 0,
+    status: data?.status || 'received',
+    statusHistory: Array.isArray(data?.statusHistory) ? data.statusHistory : [],
+    paymentMethod: data?.paymentMethod || 'pix',
+    orderType: data?.orderType || 'delivery',
+    items,
+    customer: {
+      name: customerName,
+      phone: customerPhone,
+      email: customerEmail,
+    },
+    deliveryAddress: data?.deliveryAddress && typeof data.deliveryAddress === 'object' ? data.deliveryAddress : undefined,
+  };
+}
+
+/**
+ * Saves a new or existing order to Firestore in real-time.
+ * Propagates immediately to all connected devices (Client & Kitchen/Admin).
+ */
+export async function saveOrderToFirestore(order: Order): Promise<void> {
+  const sanitized = sanitizeForFirestore({
+    ...order,
+    updatedAt: new Date().toISOString(),
+    serverTimestamp: serverTimestamp(),
+  });
+
+  const orderRef = doc(db, 'orders', order.id);
+  await setDoc(orderRef, sanitized, { merge: true });
+
+  // If order belongs to an authenticated user, also mirror under their user history
+  const userId = order.userId || (order as any).userUid;
+  if (userId) {
+    try {
+      const userOrderRef = doc(db, 'users', userId, 'orders', order.id);
+      await setDoc(userOrderRef, sanitized, { merge: true });
+    } catch (e) {
+      console.warn('Could not mirror order in user subcollection:', e);
+    }
+  }
+}
+
+/**
+ * Real-time listener for all orders in the restaurant.
+ * Kitchen/Admin uses this to receive incoming orders instantly.
+ */
+export function subscribeToOrders(onUpdate: (orders: Order[]) => void, onError?: (err: Error) => void): Unsubscribe {
+  const ordersCol = collection(db, 'orders');
+
+  return onSnapshot(
+    ordersCol,
+    (snapshot) => {
+      const list: Order[] = [];
+      snapshot.forEach((docSnap) => {
+        const rawData = docSnap.data();
+        list.push(normalizeFirestoreOrder(rawData, docSnap.id));
+      });
+
+      // Sort by creation date descending (newest first)
+      list.sort((a, b) => {
+        const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return tB - tA;
+      });
+
+      onUpdate(list);
+    },
+    (error) => {
+      console.warn('Firestore subscribeToOrders notice:', error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+/**
+ * Directly fetches all orders from Firestore (used on dashboard opening / manual refresh).
+ */
+export async function getOrdersFromFirestore(): Promise<Order[]> {
+  try {
+    const ordersCol = collection(db, 'orders');
+    const snapshot = await getDocs(ordersCol);
+    const list: Order[] = [];
+    snapshot.forEach((docSnap) => {
+      list.push(normalizeFirestoreOrder(docSnap.data(), docSnap.id));
+    });
+    list.sort((a, b) => {
+      const tA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return tB - tA;
+    });
+    return list;
+  } catch (err) {
+    console.warn('Error fetching orders from Firestore:', err);
+    return [];
+  }
+}
+
+/**
+ * Real-time listener for a single order (used by client tracking screen).
+ */
+export function subscribeToOrder(
+  orderId: string, 
+  onUpdate: (order: Order | null) => void,
+  onError?: (err: Error) => void
+): Unsubscribe {
+  const orderRef = doc(db, 'orders', orderId);
+
+  return onSnapshot(
+    orderRef,
+    (docSnap) => {
+      if (docSnap.exists()) {
+        onUpdate(normalizeFirestoreOrder(docSnap.data(), docSnap.id));
+      } else {
+        onUpdate(null);
+      }
+    },
+    (error) => {
+      console.error(`Firestore subscribeToOrder (${orderId}) error:`, error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+/**
+ * Updates order status in Firestore and appends status history.
+ * Both Admin and Client will reflect the update instantly across all connected devices.
+ */
+export async function updateOrderStatusInFirestore(
+  orderId: string, 
+  newStatus: OrderStatus, 
+  note?: string,
+  fallbackOrder?: Order
+): Promise<void> {
+  const orderRef = doc(db, 'orders', orderId);
+  const snap = await getDoc(orderRef).catch(() => null);
+
+  const timestamp = new Date().toISOString();
+  const defaultNote = note || (
+    newStatus === 'received' ? 'Pedido recebido pelo sistema.' :
+    newStatus === 'preparing' ? 'Pedido em preparação na chapa da cozinha.' :
+    newStatus === 'out_for_delivery' ? 'Pedido saiu para entrega com o motoboy.' :
+    newStatus === 'completed' ? 'Pedido finalizado e entregue com sucesso!' :
+    'Pedido cancelado.'
+  );
+
+  let newHistory: any[] = [];
+  let userId: string | undefined = undefined;
+
+  if (snap && snap.exists()) {
+    const currentData = snap.data() as Order;
+    userId = currentData.userId || (currentData as any).userUid;
+    newHistory = Array.isArray(currentData.statusHistory) ? [...currentData.statusHistory] : [];
+  } else if (fallbackOrder) {
+    userId = fallbackOrder.userId || (fallbackOrder as any).userUid;
+    newHistory = Array.isArray(fallbackOrder.statusHistory) ? [...fallbackOrder.statusHistory] : [];
+  }
+
+  newHistory.push({
+    status: newStatus,
+    timestamp,
+    note: defaultNote,
+  });
+
+  let payload: any = {
+    status: newStatus,
+    statusHistory: newHistory,
+    updatedAt: timestamp,
+    serverUpdatedAt: serverTimestamp(),
+  };
+
+  if (!snap || !snap.exists()) {
+    if (fallbackOrder) {
+      payload = {
+        ...fallbackOrder,
+        status: newStatus,
+        statusHistory: newHistory,
+        updatedAt: timestamp,
+        serverUpdatedAt: serverTimestamp(),
+      };
+    }
+  }
+
+  // Use setDoc with merge: true to guarantee update never fails due to document missing
+  await setDoc(orderRef, sanitizeForFirestore(payload), { merge: true });
+
+  // Mirror status update in user subcollection if order is linked to a user account
+  if (userId) {
+    try {
+      const userOrderRef = doc(db, 'users', userId, 'orders', orderId);
+      await setDoc(userOrderRef, sanitizeForFirestore(payload), { merge: true });
+    } catch (e) {
+      console.warn('Could not mirror order status in user subcollection:', e);
+    }
+  }
+}
+
+/**
+ * Searches for an order across Firestore by shortCode (#PO-XXXX), phone, email, or order ID.
+ */
+export async function findOrderInFirestore(term: string): Promise<Order | null> {
+  const raw = term.trim();
+  if (!raw) return null;
+
+  const cleanCode = raw.toUpperCase();
+  const cleanNumbers = raw.replace(/\D/g, '');
+
+  // 1. Direct ID match
+  try {
+    const directSnap = await getDoc(doc(db, 'orders', raw));
+    if (directSnap.exists()) {
+      return normalizeFirestoreOrder(directSnap.data(), directSnap.id);
+    }
+  } catch (e) {}
+
+  // 2. Query by shortCode (#PO-XXXX or PO-XXXX)
+  try {
+    const formatted = cleanCode.startsWith('#') ? cleanCode : `#${cleanCode}`;
+    const codeQuery = query(collection(db, 'orders'), where('shortCode', '==', formatted), limit(1));
+    const codeSnap = await getDocs(codeQuery);
+    if (!codeSnap.empty) {
+      const docSnap = codeSnap.docs[0];
+      return normalizeFirestoreOrder(docSnap.data(), docSnap.id);
+    }
+  } catch (e) {}
+
+  // 3. Query by customer phone
+  if (cleanNumbers.length >= 8) {
+    try {
+      const phoneQuery = query(collection(db, 'orders'), where('customerPhone', '==', cleanNumbers), limit(1));
+      const phoneSnap = await getDocs(phoneQuery);
+      if (!phoneSnap.empty) {
+        const docSnap = phoneSnap.docs[0];
+        return normalizeFirestoreOrder(docSnap.data(), docSnap.id);
+      }
+    } catch (e) {}
+  }
+
+  // 4. Scan recent 50 orders
+  try {
+    const recentQuery = query(collection(db, 'orders'), limit(50));
+    const recentSnap = await getDocs(recentQuery);
+    for (const d of recentSnap.docs) {
+      const ord = normalizeFirestoreOrder(d.data(), d.id);
+      if (
+        ord.shortCode?.toUpperCase().includes(cleanCode.replace('#', '')) ||
+        (cleanNumbers.length >= 8 && ord.customerPhone?.replace(/\D/g, '').includes(cleanNumbers)) ||
+        (cleanNumbers.length >= 8 && ord.customer?.phone?.replace(/\D/g, '').includes(cleanNumbers))
+      ) {
+        return ord;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+/**
+ * Subscribes to store settings (Opening hours, prep time, delivery fee, admin PIN).
+ */
+export function subscribeToStoreSettings(onUpdate: (settings: StoreSettings) => void, onError?: (err: Error) => void): Unsubscribe {
+  const docRef = doc(db, 'store_settings', 'main_config');
+  return onSnapshot(
+    docRef, 
+    (docSnap) => {
+      if (docSnap.exists()) {
+        onUpdate(docSnap.data() as StoreSettings);
+      }
+    },
+    (error) => {
+      console.warn('Firestore subscribeToStoreSettings offline/network notice:', error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+/**
+ * Saves or updates a user profile in Firestore.
+ */
+export async function saveUserProfileToFirestore(profile: UserProfile): Promise<void> {
+  const sanitized = sanitizeForFirestore({
+    ...profile,
+    updatedAt: new Date().toISOString(),
+    serverUpdatedAt: serverTimestamp(),
+  });
+  const userRef = doc(db, 'users', profile.uid);
+  await setDoc(userRef, sanitized, { merge: true });
+}
+
+/**
+ * Retrieves a user profile from Firestore by UID.
+ */
+export async function getUserProfileFromFirestore(uid: string): Promise<UserProfile | null> {
+  try {
+    const userRef = doc(db, 'users', uid);
+    const snap = await getDoc(userRef);
+    if (snap.exists()) {
+      return { ...(snap.data() as UserProfile), uid: snap.id };
+    }
+  } catch (e) {
+    console.warn(`Could not get user profile ${uid} from Firestore:`, e);
+  }
+  return null;
+}
+
+/**
+ * Searches for an existing user profile by phone number or email.
+ */
+export async function findUserProfileByPhoneOrEmail(identifier: string): Promise<UserProfile | null> {
+  const clean = identifier.trim().toLowerCase();
+  const digitsOnly = clean.replace(/\D/g, '');
+
+  // 1. Search by email directly in users collection
+  if (clean.includes('@')) {
+    try {
+      const emailQuery = query(collection(db, 'users'), where('email', '==', clean), limit(1));
+      const snap = await getDocs(emailQuery);
+      if (!snap.empty) {
+        return { ...(snap.docs[0].data() as UserProfile), uid: snap.docs[0].id };
+      }
+    } catch (e) {}
+  }
+
+  // 2. Search by phone in users collection
+  if (digitsOnly.length >= 8) {
+    try {
+      const phoneQuery = query(collection(db, 'users'), where('phone', '==', digitsOnly), limit(1));
+      const snap = await getDocs(phoneQuery);
+      if (!snap.empty) {
+        return { ...(snap.docs[0].data() as UserProfile), uid: snap.docs[0].id };
+      }
+    } catch (e) {}
+  }
+
+  // 3. Fallback scan on users collection
+  try {
+    const allUsersQuery = query(collection(db, 'users'), limit(50));
+    const allSnap = await getDocs(allUsersQuery);
+    for (const d of allSnap.docs) {
+      const uData = d.data() as UserProfile;
+      const uEmail = String(uData.email || '').trim().toLowerCase();
+      const uPhone = String(uData.phone || '').replace(/\D/g, '');
+      if (clean.includes('@') && uEmail === clean) {
+        return { ...uData, uid: d.id };
+      }
+      if (digitsOnly.length >= 8 && uPhone && (uPhone === digitsOnly || uPhone.endsWith(digitsOnly) || digitsOnly.endsWith(uPhone))) {
+        return { ...uData, uid: d.id };
+      }
+    }
+  } catch (e) {}
+
+  // 4. Fallback search in orders collection to reconstruct profile if user ordered previously
+  try {
+    const recentOrdersQuery = query(collection(db, 'orders'), limit(30));
+    const orderSnap = await getDocs(recentOrdersQuery);
+    for (const d of orderSnap.docs) {
+      const o = normalizeFirestoreOrder(d.data(), d.id);
+      const oEmail = String(o.userEmail || o.customerEmail || o.customer?.email || '').trim().toLowerCase();
+      const oPhone = String(o.customerPhone || o.customer?.phone || '').replace(/\D/g, '');
+      const oName = String(o.customer?.name || '').trim();
+
+      const matchesEmail = clean.includes('@') && oEmail && oEmail === clean;
+      const matchesPhone = digitsOnly.length >= 8 && oPhone && (oPhone === digitsOnly || oPhone.endsWith(digitsOnly) || digitsOnly.endsWith(oPhone));
+
+      if (matchesEmail || matchesPhone) {
+        const reconstructed: UserProfile = {
+          uid: o.userId || `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+          name: oName || 'Cliente PO-PI-DI',
+          email: oEmail || (clean.includes('@') ? clean : ''),
+          phone: oPhone || digitsOnly,
+          role: 'customer',
+          loyaltyPoints: 50,
+          loyaltyTier: 'Bronze',
+          defaultAddress: o.deliveryAddress,
+          createdAt: o.createdAt || new Date().toISOString(),
+        };
+        // Save to users collection in background
+        saveUserProfileToFirestore(reconstructed).catch(() => {});
+        return reconstructed;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+/**
+ * Adds loyalty points to a user's account in Firestore.
+ */
+export async function creditUserLoyaltyPoints(userId: string, points: number): Promise<void> {
+  try {
+    const userDocRef = doc(db, 'users', userId);
+    const userSnap = await getDoc(userDocRef);
+    if (userSnap.exists()) {
+      const currentPts = userSnap.data().loyaltyPoints || 50;
+      await updateDoc(userDocRef, {
+        loyaltyPoints: currentPts + points,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (e) {
+    console.warn('Error updating loyalty points in Firestore:', e);
+  }
+}
+
+/**
+ * Saves updated store settings to Firestore.
+ */
+export async function saveStoreSettingsToFirestore(settings: Partial<StoreSettings>): Promise<void> {
+  const docRef = doc(db, 'store_settings', 'main_config');
+  const payload = sanitizeForFirestore({
+    ...settings,
+    updatedAt: new Date().toISOString(),
+  });
+  await setDoc(docRef, payload, { merge: true });
+}
+
+/**
+ * Saves an individual MenuItem to Firestore (inserts or updates).
+ * Syncs instantly to all connected clients.
+ */
+export async function saveMenuItemToFirestore(item: MenuItem): Promise<void> {
+  const itemRef = doc(db, 'menu_items', item.id);
+  const payload = sanitizeForFirestore({
+    ...item,
+    updatedAt: new Date().toISOString(),
+  });
+  await setDoc(itemRef, payload, { merge: true });
+
+  // Also persist in the backup catalog document to ensure fast single-query loads
+  try {
+    const catalogRef = doc(db, 'store_settings', 'menu_catalog');
+    const catalogSnap = await getDoc(catalogRef);
+    let items: MenuItem[] = [];
+    if (catalogSnap.exists()) {
+      const data = catalogSnap.data();
+      if (Array.isArray(data?.items)) {
+        items = data.items;
+      }
+    }
+    const idx = items.findIndex(i => i.id === item.id);
+    if (idx >= 0) {
+      items[idx] = item;
+    } else {
+      items.push(item);
+    }
+    await setDoc(catalogRef, { items: sanitizeForFirestore(items), updatedAt: new Date().toISOString() }, { merge: true });
+  } catch (e) {
+    console.warn('Backup catalog update warning:', e);
+  }
+}
+
+/**
+ * Deletes a MenuItem from Firestore.
+ */
+export async function deleteMenuItemFromFirestore(itemId: string): Promise<void> {
+  const itemRef = doc(db, 'menu_items', itemId);
+  await deleteDoc(itemRef);
+
+  // Also remove from backup catalog
+  try {
+    const catalogRef = doc(db, 'store_settings', 'menu_catalog');
+    const catalogSnap = await getDoc(catalogRef);
+    if (catalogSnap.exists()) {
+      const data = catalogSnap.data();
+      if (Array.isArray(data?.items)) {
+        const filtered = data.items.filter((i: any) => i.id !== itemId);
+        await setDoc(catalogRef, { items: sanitizeForFirestore(filtered), updatedAt: new Date().toISOString() }, { merge: true });
+      }
+    }
+  } catch (e) {
+    console.warn('Backup catalog deletion warning:', e);
+  }
+}
+
+/**
+ * Saves or restores the entire catalog of MenuItems to Firestore.
+ */
+export async function saveAllMenuItemsToFirestore(items: MenuItem[]): Promise<void> {
+  // 1. Save all in the centralized catalog document for immediate batch sync
+  const catalogRef = doc(db, 'store_settings', 'menu_catalog');
+  await setDoc(catalogRef, {
+    items: sanitizeForFirestore(items),
+    updatedAt: new Date().toISOString(),
+  });
+
+  // 2. Also update individual docs in menu_items collection
+  for (const item of items) {
+    try {
+      const itemRef = doc(db, 'menu_items', item.id);
+      await setDoc(itemRef, sanitizeForFirestore(item), { merge: true });
+    } catch (e) {
+      // Continue batch
+    }
+  }
+}
+
+/**
+ * Real-time listener for all MenuItems in Firestore.
+ * Listens to the menu_catalog document or menu_items collection for instant real-time synchronization across all devices.
+ */
+export function subscribeToMenuItems(onUpdate: (items: MenuItem[]) => void, onError?: (err: Error) => void): Unsubscribe {
+  // Listen to centralized catalog first for instant atomicity
+  const catalogRef = doc(db, 'store_settings', 'menu_catalog');
+  
+  return onSnapshot(
+    catalogRef,
+    (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (Array.isArray(data?.items) && data.items.length > 0) {
+          onUpdate(data.items as MenuItem[]);
+        }
+      }
+    },
+    (error) => {
+      console.warn('Firestore subscribeToMenuItems offline/network notice:', error);
+      if (onError) onError(error);
+    }
+  );
+}
+
+

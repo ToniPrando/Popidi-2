@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 
 export const AboutSection: React.FC = () => {
-  const { storeSettings, setSelectedProductForModal, menuItems, triggerStoreClosedNotice } = useCart();
+  const { storeSettings } = useCart();
   const [copiedAddress, setCopiedAddress] = useState(false);
 
   const handleCopyAddress = () => {
@@ -32,17 +32,6 @@ export const AboutSection: React.FC = () => {
     navigator.clipboard.writeText(fullText);
     setCopiedAddress(true);
     setTimeout(() => setCopiedAddress(false), 2500);
-  };
-
-  const handleOpenXtudo = () => {
-    if (storeSettings.isOpen === false) {
-      triggerStoreClosedNotice();
-      return;
-    }
-    const xtudoItem = menuItems.find(i => i.id === 'xtudo-especial');
-    if (xtudoItem) {
-      setSelectedProductForModal(xtudoItem);
-    }
   };
 
   const instagramPosts = [
@@ -153,13 +142,17 @@ export const AboutSection: React.FC = () => {
               </div>
 
               <div className="pt-3">
-                <button
+                <a
                   id="btn-order-xtudo-spotlight"
-                  onClick={handleOpenXtudo}
-                  className="bg-gradient-to-r from-emerald-500 to-green-500 hover:from-emerald-400 hover:to-green-400 text-black font-black text-sm px-7 py-3.5 rounded-xl shadow-lg shadow-emerald-500/25 hover:scale-[1.02] transition-all border border-emerald-300/40"
+                  href={`https://wa.me/${getCleanWhatsAppNumber(storeSettings.phoneWhatsApp)}?text=${encodeURIComponent('Olá! Gostaria de pedir o Famoso X-Tudo Especial pelo WhatsApp na PO-PI-DI Hamburgueria!')}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center justify-center gap-2.5 bg-[#25D366] hover:bg-[#20ba59] text-black font-black text-sm px-7 py-3.5 rounded-xl shadow-lg shadow-emerald-500/25 hover:scale-[1.02] active:scale-98 transition-all border border-emerald-300/40"
+                  title="Pedir X-Tudo pelo WhatsApp"
                 >
-                  Pedir X-Tudo Agora
-                </button>
+                  <MessageCircle className="w-4 h-4 text-black fill-current shrink-0" />
+                  <span>Pedir X-Tudo Agora</span>
+                </a>
               </div>
             </div>
 
